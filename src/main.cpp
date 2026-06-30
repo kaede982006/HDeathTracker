@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -19,6 +21,7 @@ using namespace geode::prelude;
 namespace {
 constexpr int START_POS_ID = 31;
 constexpr int HISTOGRAM_SIZE = 100;
+constexpr int START_POS_CHANGE_GRACE_FRAMES = 20;
 constexpr float START_POS_MATCH_SKIP_PENALTY = 300.f;
 constexpr char const* POPUP_NODE_ID = "hyobeen.hdeathtracker/death-stats-popup";
 
@@ -57,6 +60,8 @@ struct TrackerData {
     std::vector<Histogram> startHists;
 };
 
+void saveTrackerData(GJGameLevel* level, TrackerData const& data);
+
 std::string levelKey(GJGameLevel* level) {
     if (!level) return "unknown";
 
@@ -71,6 +76,37 @@ std::string legacyLevelKey(GJGameLevel* level) {
     auto id = static_cast<int>(level->m_levelID.value());
     auto original = static_cast<int>(level->m_originalLevel.value());
     return fmt::format("{}:{}:{}", id, original, std::string(level->m_levelName));
+}
+
+uint64_t stableHash(std::string_view text) {
+    uint64_t hash = 14695981039346656037ull;
+    for (auto ch : text) {
+        hash ^= static_cast<uint8_t>(ch);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string stableLevelKey(GJGameLevel* level) {
+    if (!level) return "unknown";
+
+    auto id = static_cast<int>(level->m_levelID.value());
+    if (id != 0) return fmt::format("level_{}", id);
+
+    if (level->m_M_ID != 0) return fmt::format("mid_{}", level->m_M_ID);
+
+    auto original = static_cast<int>(level->m_originalLevel.value());
+    if (original != 0) return fmt::format("local_original_{}_hash_{:016x}", original, stableHash(std::string_view(level->m_levelString)));
+
+    if (!level->m_levelString.empty()) {
+        return fmt::format("hash_{:016x}", stableHash(std::string_view(level->m_levelString)));
+    }
+
+    return "unknown";
+}
+
+std::filesystem::path trackerDataPath(GJGameLevel* level) {
+    return Mod::get()->getSaveDir() / "death-data" / (stableLevelKey(level) + ".txt");
 }
 
 bool hasTrackerData(Mod* mod, std::string const& key) {
@@ -310,6 +346,51 @@ std::vector<Histogram> alignStartHistograms(
 TrackerData loadTrackerData(GJGameLevel* level, std::vector<float> currentStarts) {
     auto mod = Mod::get();
     auto key = readLevelKey(level);
+    auto path = trackerDataPath(level);
+
+    if (std::ifstream file(path); file) {
+        std::string token;
+        size_t count = 0;
+
+        TrackerData fileData;
+        if (file >> token && token == "HDT2" &&
+            file >> token && token == "START_XS" &&
+            file >> count
+        ) {
+            fileData.startXs.resize(count);
+            for (auto& value : fileData.startXs) file >> value;
+
+            if (file >> token && token == "TOTAL") {
+                fileData.totalHist.resize(HISTOGRAM_SIZE);
+                for (auto& value : fileData.totalHist) file >> value;
+
+                if (file >> token && token == "START_HISTS" && file >> count) {
+                    fileData.startHists.assign(count, Histogram(HISTOGRAM_SIZE, 0));
+                    bool valid = true;
+                    for (auto& hist : fileData.startHists) {
+                        file >> token;
+                        if (token != "HIST") {
+                            valid = false;
+                            break;
+                        }
+                        for (auto& value : hist) file >> value;
+                    }
+
+                    if (valid && file) {
+                        if (currentStarts.empty() && !fileData.startXs.empty()) {
+                            currentStarts = fileData.startXs;
+                        }
+                        fileData.totalHist = normalizeHistogram(std::move(fileData.totalHist));
+                        fileData.startHists = alignStartHistograms(fileData.startXs, std::move(fileData.startHists), currentStarts);
+                        fileData.startXs = currentStarts;
+                        return fileData;
+                    }
+                }
+            }
+        }
+
+        log::warn("Ignoring malformed death tracker data file: {}", path.string());
+    }
 
     auto oldXs = mod->getSavedValue<std::vector<float>>(key + ".start-xs");
     auto oldStartHists = mod->getSavedValue<std::vector<Histogram>>(key + ".start-hists");
@@ -321,16 +402,38 @@ TrackerData loadTrackerData(GJGameLevel* level, std::vector<float> currentStarts
     data.startXs = currentStarts;
     data.totalHist = normalizeHistogram(mod->getSavedValue<Histogram>(key + ".total-hist"));
     data.startHists = alignStartHistograms(oldXs, oldStartHists, currentStarts);
+    if (std::accumulate(data.totalHist.begin(), data.totalHist.end(), 0) > 0 || !data.startHists.empty()) {
+        saveTrackerData(level, data);
+    }
     return data;
 }
 
 void saveTrackerData(GJGameLevel* level, TrackerData const& data) {
-    auto key = levelKey(level);
-    auto mod = Mod::get();
+    auto path = trackerDataPath(level);
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        log::warn("Failed to create death tracker data directory: {}", ec.message());
+        return;
+    }
 
-    mod->setSavedValue(key + ".start-xs", data.startXs);
-    mod->setSavedValue(key + ".total-hist", data.totalHist);
-    mod->setSavedValue(key + ".start-hists", data.startHists);
+    std::ofstream file(path, std::ios::trunc);
+    if (!file) {
+        log::warn("Failed to open death tracker data file: {}", path.string());
+        return;
+    }
+
+    file << "HDT2\n";
+    file << "START_XS " << data.startXs.size();
+    for (auto value : data.startXs) file << ' ' << value;
+    file << "\nTOTAL";
+    for (auto value : normalizeHistogram(data.totalHist)) file << ' ' << value;
+    file << "\nSTART_HISTS " << data.startHists.size() << '\n';
+    for (auto hist : data.startHists) {
+        file << "HIST";
+        for (auto value : normalizeHistogram(std::move(hist))) file << ' ' << value;
+        file << '\n';
+    }
 }
 
 int histogramTotal(Histogram const& hist) {
@@ -600,27 +703,51 @@ int deathPercentBucket(PlayLayer* layer, float deathX) {
 class $modify(HDeathTrackerPlayLayer, PlayLayer) {
     struct Fields {
         bool deathRecorded = false;
+        int startPosChangeFrames = 0;
+        StartPosObject* lastStartPosObject = nullptr;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
         m_fields->deathRecorded = false;
+        m_fields->startPosChangeFrames = 0;
+        m_fields->lastStartPosObject = m_startPosObject;
         return true;
+    }
+
+    void postUpdate(float dt) {
+        PlayLayer::postUpdate(dt);
+
+        if (m_startPosObject != m_fields->lastStartPosObject) {
+            m_fields->lastStartPosObject = m_startPosObject;
+            m_fields->startPosChangeFrames = START_POS_CHANGE_GRACE_FRAMES;
+        }
+        else if (m_fields->startPosChangeFrames > 0) {
+            m_fields->startPosChangeFrames -= 1;
+        }
     }
 
     void resetLevel() {
         m_fields->deathRecorded = false;
         PlayLayer::resetLevel();
+        m_fields->startPosChangeFrames = 0;
+        m_fields->lastStartPosObject = m_startPosObject;
     }
 
     void resetLevelFromStart() {
         m_fields->deathRecorded = false;
         PlayLayer::resetLevelFromStart();
+        m_fields->startPosChangeFrames = 0;
+        m_fields->lastStartPosObject = m_startPosObject;
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
+        auto shouldIgnoreStartPosNavigation =
+            m_startPosObject != m_fields->lastStartPosObject ||
+            m_fields->startPosChangeFrames > 0;
         auto shouldTrack =
+            !shouldIgnoreStartPosNavigation &&
             !m_fields->deathRecorded &&
             player &&
             !player->m_isDead &&
@@ -633,6 +760,10 @@ class $modify(HDeathTrackerPlayLayer, PlayLayer) {
 
         PlayLayer::destroyPlayer(player, object);
 
+        if (shouldIgnoreStartPosNavigation) {
+            m_fields->startPosChangeFrames = 0;
+            m_fields->lastStartPosObject = m_startPosObject;
+        }
         if (!shouldTrack) return;
         m_fields->deathRecorded = true;
 
