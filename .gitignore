@@ -62,3 +62,19 @@ build-*/
 # CLion
 .idea/
 /cmake-build-*/
+
+build/
+out/
+dist/
+.cache/
+*.geode
+*.dll
+*.so
+*.dylib
+*.pdb
+*.zip
+*.7z
+*.tar.gz
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
